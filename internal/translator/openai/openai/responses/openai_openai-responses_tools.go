@@ -19,6 +19,7 @@ type responsesToolDeclaration struct {
 	localName string
 	namespace string
 	custom    bool
+	search    bool // the client tool_search declaration, bridged as a function
 }
 
 // walkResponsesToolDeclarations visits the tool declarations of a Responses
@@ -40,6 +41,16 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 		case "", "function":
 		case "custom":
 			custom = true
+		case "tool_search":
+			if namespaceName == "" && isResponsesClientToolSearch(tool) {
+				declarations = append(declarations, responsesToolDeclaration{
+					tool:      tool,
+					chatName:  responsesToolSearchName,
+					localName: responsesToolSearchName,
+					search:    true,
+				})
+			}
+			return
 		default:
 			return
 		}
@@ -78,7 +89,10 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 	scan(root.Get("tools"))
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			switch item.Get("type").String() {
+			case "additional_tools", "tool_search_output":
+				// Tools returned by a client tool search stay declared on every
+				// later request, so the model can call what it loaded.
 				scan(item.Get("tools"))
 			}
 			return true

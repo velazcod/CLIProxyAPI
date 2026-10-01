@@ -231,6 +231,8 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		}
 
 		for _, item := range inputItems {
+			// Client tool search replays as an ordinary function call pair.
+			item = bridgeResponsesToolSearchItemToFunction(item)
 			itemType := item.Get("type").String()
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"

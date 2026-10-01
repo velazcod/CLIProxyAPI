@@ -49,6 +49,7 @@ type oaiToResponsesState struct {
 	// function item state
 	FuncItemAdded  map[string]bool
 	FuncItemCustom map[string]bool
+	FuncItemSearch map[string]bool
 	FuncArgsDone   map[string]bool
 	FuncItemDone   map[string]bool
 	// names of freeform ("custom") tools from the original request; calls to
@@ -210,6 +211,10 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 			if _, isInc := incompleteByFinishReason(st.FinishReason); isInc {
 				toolStatus = "incomplete"
 			}
+			if st.FuncItemSearch[key] {
+				outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: buildResponsesToolSearchCallItem(callID, args, toolStatus)})
+				continue
+			}
 			if st.FuncItemCustom[key] {
 				item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
@@ -270,6 +275,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			MsgItemDone:     make(map[int]bool),
 			FuncItemAdded:   make(map[string]bool),
 			FuncItemCustom:  make(map[string]bool),
+			FuncItemSearch:  make(map[string]bool),
 			FuncArgsDone:    make(map[string]bool),
 			FuncItemDone:    make(map[string]bool),
 			Reasonings:      make([]oaiToResponsesStateReasoning, 0),
@@ -368,7 +374,16 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		outputIndex := st.FuncOutputIx[key]
 		_, isCustomTool := st.CustomToolNames[name]
 		st.FuncItemCustom[key] = isCustomTool
-		if isCustomTool {
+		_, isToolSearch := st.ToolIndex.search[name]
+		st.FuncItemSearch[key] = isToolSearch && !isCustomTool
+		if st.FuncItemSearch[key] {
+			o := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"tool_search_call","status":"in_progress","execution":"client","call_id":"","arguments":{}}}`)
+			o, _ = sjson.SetBytes(o, "sequence_number", nextSeq())
+			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
+			o, _ = sjson.SetBytes(o, "item.id", responsesToolSearchCallID(callID))
+			o, _ = sjson.SetBytes(o, "item.call_id", callID)
+			out = append(out, emitRespEvent("response.output_item.added", o))
+		} else if isCustomTool {
 			o := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 			o, _ = sjson.SetBytes(o, "sequence_number", nextSeq())
 			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
@@ -388,7 +403,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.FuncItemAdded[key] = true
 	}
 	emitPendingFunctionArgs := func(key string) {
-		if !st.FuncItemAdded[key] || st.FuncItemCustom[key] {
+		if !st.FuncItemAdded[key] || st.FuncItemCustom[key] || st.FuncItemSearch[key] {
 			return
 		}
 		argsBuf := st.FuncArgsBuf[key]
@@ -427,6 +442,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.MsgItemDone = make(map[int]bool)
 		st.FuncItemAdded = make(map[string]bool)
 		st.FuncItemCustom = make(map[string]bool)
+		st.FuncItemSearch = make(map[string]bool)
 		st.FuncArgsDone = make(map[string]bool)
 		st.FuncItemDone = make(map[string]bool)
 		st.CustomToolNames = st.ToolIndex.custom
@@ -591,6 +607,16 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				toolStatus = "incomplete"
 			}
 
+			if st.FuncItemSearch[key] {
+				itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+				itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+				itemDone, _ = sjson.SetBytes(itemDone, "output_index", outputIndex)
+				itemDone, _ = sjson.SetRawBytes(itemDone, "item", buildResponsesToolSearchCallItem(callID, args, toolStatus))
+				out = append(out, emitRespEvent("response.output_item.done", itemDone))
+				st.FuncItemDone[key] = true
+				st.FuncArgsDone[key] = true
+				continue
+			}
 			if st.FuncItemCustom[key] {
 				input := unwrapCustomToolInput(args)
 				inputDone := []byte(`{"type":"response.custom_tool_call_input.done","sequence_number":0,"item_id":"","output_index":0,"input":""}`)
@@ -953,6 +979,10 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						toolStatus := "completed"
 						if isIncomplete {
 							toolStatus = "incomplete"
+						}
+						if _, isToolSearch := toolIndex.search[name]; isToolSearch {
+							outputItems = append(outputItems, buildResponsesToolSearchCallItem(callID, args, toolStatus))
+							return true
 						}
 						if _, isCustomTool := customToolNames[name]; isCustomTool {
 							item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)

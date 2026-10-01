@@ -34,6 +34,7 @@ type claudeToResponsesState struct {
 	FuncNames         map[int]string // Claude block index -> function name
 	FuncCallIDs       map[int]string // Claude block index -> call id
 	FuncCustom        map[int]bool   // Claude block index -> freeform custom tool
+	FuncSearch        map[int]bool   // Claude block index -> client tool_search call
 	FuncOutputIndices map[int]int    // Claude block index -> Responses output index
 	// message text aggregation
 	TextBuf            strings.Builder
@@ -285,7 +286,13 @@ func (st *claudeToResponsesState) finalizeFuncItem(idx int, requestForToolMetada
 	name := st.FuncNames[idx]
 
 	var out [][]byte
-	if st.FuncCustom[idx] {
+	if st.FuncSearch[idx] {
+		itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+		itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+		itemDone, _ = sjson.SetBytes(itemDone, "output_index", outputIndex)
+		itemDone, _ = sjson.SetRawBytes(itemDone, "item", buildResponsesToolSearchCallItem(callID, args, status))
+		out = append(out, emitEvent("response.output_item.done", itemDone))
+	} else if st.FuncCustom[idx] {
 		input := unwrapCustomToolInput(args)
 		if !st.FuncArgsDone[idx] {
 			if st.FuncArgsDone == nil {
@@ -595,9 +602,18 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				st.FuncCustom = make(map[int]bool)
 			}
 			st.FuncCustom[idx] = isCustomTool
+			isToolSearch := !isCustomTool && name != "" && name == responsesToolSearchClaudeName(requestForToolMetadata)
+			if st.FuncSearch == nil {
+				st.FuncSearch = make(map[int]bool)
+			}
+			st.FuncSearch[idx] = isToolSearch
 			outputIndex := st.functionOutputIndex(idx)
 			var item []byte
-			if isCustomTool {
+			if isToolSearch {
+				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"tool_search_call","status":"in_progress","execution":"client","call_id":"","arguments":{}}}`)
+				item, _ = sjson.SetBytes(item, "item.id", responsesToolSearchCallID(st.CurrentFCID))
+				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
+			} else if isCustomTool {
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("ctc_%s", st.CurrentFCID))
 				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
@@ -694,7 +710,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					st.FuncArgsBuf[idx] = &strings.Builder{}
 				}
 				st.FuncArgsBuf[idx].WriteString(pj.String())
-				if st.FuncCustom[idx] {
+				if st.FuncCustom[idx] || st.FuncSearch[idx] {
 					return [][]byte{}
 				}
 				outputIndex := st.functionOutputIndex(idx)
@@ -909,7 +925,9 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				if callID == "" && st.CurrentFCID != "" {
 					callID = st.CurrentFCID
 				}
-				if st.FuncCustom[idx] {
+				if st.FuncSearch[idx] {
+					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.FuncOutputIndices[idx]), buildResponsesToolSearchCallItem(callID, args, status))
+				} else if st.FuncCustom[idx] {
 					item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
 					item, _ = sjson.SetBytes(item, "status", status)
@@ -982,6 +1000,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 
 	reqBytes := pickRequestJSON(originalRequestRawJSON, requestRawJSON)
 	customToolNames := responsesCustomToolNames(reqBytes)
+	toolSearchName := responsesToolSearchClaudeName(reqBytes)
 
 	// Base OpenAI Responses (non-stream) object
 	out := []byte(`{"id":"","object":"response","created_at":0,"status":"completed","background":false,"error":null,"incomplete_details":null,"output":[],"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{},"total_tokens":0}}`)
@@ -1072,10 +1091,14 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				itemType := "function_call"
 				if _, isCustomTool := customToolNames[cb.Get("name").String()]; isCustomTool {
 					itemType = "custom_tool_call"
+				} else if toolSearchName != "" && cb.Get("name").String() == toolSearchName {
+					itemType = "tool_search_call"
 				}
 				item := newOutputItem(itemType, idx)
 				item.callID = cb.Get("id").String()
-				if itemType == "custom_tool_call" {
+				if itemType == "tool_search_call" {
+					item.id = responsesToolSearchCallID(item.callID)
+				} else if itemType == "custom_tool_call" {
 					item.id = fmt.Sprintf("ctc_%s", item.callID)
 				} else {
 					item.id = fmt.Sprintf("fc_%s", item.callID)
@@ -1125,7 +1148,7 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 					}
 				}
 			case "input_json_delta":
-				if item != nil && (item.itemType == "function_call" || item.itemType == "custom_tool_call" || item.itemType == "web_search_call") {
+				if item != nil && (item.itemType == "function_call" || item.itemType == "custom_tool_call" || item.itemType == "tool_search_call" || item.itemType == "web_search_call") {
 					if pj := d.Get("partial_json"); pj.Exists() {
 						item.args.WriteString(pj.String())
 					}
@@ -1267,6 +1290,8 @@ func ConvertClaudeResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 			if len(outputItem.annotations) > 0 {
 				item, _ = sjson.SetBytes(item, "content.0.annotations", outputItem.annotations)
 			}
+		case "tool_search_call":
+			item = buildResponsesToolSearchCallItem(outputItem.callID, outputItem.args.String(), itemStatus)
 		case "function_call", "custom_tool_call":
 			if outputItem.itemType == "custom_tool_call" {
 				item = []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
