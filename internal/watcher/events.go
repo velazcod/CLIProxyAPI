@@ -27,11 +27,17 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
-	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
-		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
+	if _, errStatConfig := os.Stat(w.configPath); errStatConfig != nil {
+		log.Errorf("failed to stat config file %s: %v", w.configPath, errStatConfig)
+		return errStatConfig
+	}
+	// Watch the parent so atomic replacement does not remove the config watch.
+	configDir := filepath.Dir(w.configPath)
+	if errAddConfig := w.watcher.Add(configDir); errAddConfig != nil {
+		log.Errorf("failed to watch config directory %s: %v", configDir, errAddConfig)
 		return errAddConfig
 	}
-	log.Debugf("watching config file: %s", w.configPath)
+	log.Debugf("watching config directory %s for file %s", configDir, w.configPath)
 
 	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
 		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
