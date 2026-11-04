@@ -82,7 +82,7 @@ func convertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 
 	// Convert input array to messages
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
-		rawInputArray := toolIndex.shellHistory(input.Array())
+		rawInputArray := toolIndex.toolSearchHistory(toolIndex.shellHistory(input.Array()))
 		explicitOutputCounts := make(map[string]int)
 		missingIDOutputsCount := 0
 		for _, item := range rawInputArray {
